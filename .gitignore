@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.tmp
+users.txt
+rooms.json
+questions_config.json
+history/
+history_index.json
