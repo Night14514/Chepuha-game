@@ -52,6 +52,7 @@ HELP_TEXT = """Команды:
 /rules — правила
 /result — ваши завершённые игры
 /get <id> — получить файл истории игры
+/finish — подтвердить, что дочитал историю (только во время чтения)
 /help — этот список
 /cancel — отменить текущий диалог
 
@@ -111,7 +112,10 @@ class NotInPlayingGame(Filter):
         if user is None:
             return True
         room = st.find_player_room(user.id)
-        return not (room and room.get("status") == config.STATUS_PLAYING)
+        return not (
+            room
+            and room.get("status") in (config.STATUS_PLAYING, config.STATUS_REVEALING)
+        )
 
 
 room_lock = asyncio.Lock()
@@ -172,6 +176,10 @@ def _status_human(room: dict[str, Any]) -> str:
         n = int(room.get("current_question_index", 0)) + 1
         total = len(room.get("questions") or []) or 9
         return f"игра идёт, вопрос №{n} из {total}"
+    if status == config.STATUS_REVEALING:
+        n = int(room.get("reveal_index", 0)) + 1
+        total = len(room.get("reveal_order") or [])
+        return f"чтение историй ({n} из {total})"
     if status == config.STATUS_FINISHED:
         return "завершена"
     if status == config.STATUS_CANCELLED:
@@ -489,7 +497,7 @@ async def cmd_players(message: Message) -> None:
 @router.message(Command("edit"))
 async def cmd_edit(message: Message, state: FSMContext) -> None:
     room = st.get_active_room()
-    if room and room.get("status") == config.STATUS_PLAYING:
+    if room and room.get("status") in (config.STATUS_PLAYING, config.STATUS_REVEALING):
         await message.answer("Нельзя менять вопросы во время активной игры.")
         return
     listing = _format_questions_list()
@@ -529,7 +537,7 @@ async def edit_order_input(message: Message, state: FSMContext) -> None:
 @router.message(Command("edit_qu"))
 async def cmd_edit_qu(message: Message, state: FSMContext) -> None:
     room = st.get_active_room()
-    if room and room.get("status") == config.STATUS_PLAYING:
+    if room and room.get("status") in (config.STATUS_PLAYING, config.STATUS_REVEALING):
         await message.answer("Нельзя менять вопросы во время активной игры.")
         return
     await state.set_state(EditQuestion.waiting_number)
@@ -671,6 +679,47 @@ async def cmd_get(message: Message, command: CommandObject) -> None:
     await message.answer_document(FSInputFile(path))
 
 
+@router.message(Command("finish"))
+async def cmd_finish(message: Message, bot: Bot) -> None:
+    user = message.from_user
+    if user is None:
+        return
+    error: str | None = None
+    next_room: dict[str, Any] | None = None
+    finished_ids: list[int] | None = None
+    async with room_lock:
+        rooms = st.load_rooms()
+        room = _current_reader_room(rooms, user.id)
+        if not room:
+            error = "Сейчас не ваша очередь читать историю."
+        else:
+            room["reveal_index"] = int(room.get("reveal_index", 0)) + 1
+            order = room.get("reveal_order") or []
+            if room["reveal_index"] < len(order):
+                st.save_rooms(rooms)
+                next_room = room
+            else:
+                finished_ids = _player_ids(room)
+                room["status"] = config.STATUS_FINISHED
+                room.pop("reveal_order", None)
+                room.pop("reveal_stories", None)
+                room.pop("reveal_index", None)
+                st.save_rooms(rooms)
+    if error:
+        await message.answer(error)
+        return
+    if next_room:
+        await _reveal_current(bot, next_room)
+        return
+    if finished_ids:
+        await _broadcast(
+            bot,
+            finished_ids,
+            "Игра завершена! Для просмотра историй напишите /result",
+        )
+
+
+
 @router.message(F.text, ~F.text.startswith("/"))
 async def on_answer(message: Message, bot: Bot, state: FSMContext) -> None:
     user = message.from_user
@@ -737,7 +786,7 @@ async def _advance_round(bot: Bot, room_id: str) -> None:
             next_q = questions[idx + 1]["text"]
             ids = _player_ids(room)
     if finish:
-        await _reveal_stories(bot, finish)
+        await _reveal_current(bot, finish)
         return
     if next_q:
         await _broadcast(bot, ids, next_q)
@@ -755,32 +804,49 @@ def _close_room(rooms: dict[str, Any], room: dict[str, Any]) -> dict[str, Any]:
     date = st.today_str()
     history_text = _build_history_text(room, date, assignment)
     st.append_history(str(room["id"]), date, players, history_text)
-    room["status"] = config.STATUS_FINISHED
+    room["status"] = config.STATUS_REVEALING
     room["answers_this_round"] = {}
+    room["reveal_order"] = [int(player["user_id"]) for player, _ in assignment]
+    room["reveal_stories"] = [_story_text(questions, answers) for _, answers in assignment]
+    room["reveal_index"] = 0
     st.save_rooms(rooms)
-    return {
-        "players": players,
-        "questions": questions,
-        "assignment": assignment,
-    }
+    return room
 
 
-async def _reveal_stories(bot: Bot, finish: dict[str, Any]) -> None:
-    players = finish["players"]
-    questions = finish["questions"]
-    assignment: list[tuple[dict, list[str]]] = finish["assignment"]
-    for i, (player, answers) in enumerate(assignment):
-        story = _story_text(questions, answers)
-        reader_id = int(player["user_id"])
-        reader_label = st.format_user_label(reader_id, player.get("username"))
-        others = [int(p["user_id"]) for p in players if int(p["user_id"]) != reader_id]
-        await _broadcast(bot, others, f"{reader_label} читает историю, слушаем!")
-        await _safe_send(bot, reader_id, "Тебе выпала честь, прочесть эту легендарную историю!")
-        await _safe_send(bot, reader_id, story)
-        if i < len(assignment) - 1:
-            await asyncio.sleep(config.REVEAL_PAUSE_SECONDS)
-    ids = [int(p["user_id"]) for p in players]
-    await _broadcast(bot, ids, "Игра завершена! Для просмотра историй напишите /result")
+def _current_reader_room(rooms: dict[str, Any], user_id: int) -> dict[str, Any] | None:
+    for room in rooms.values():
+        if room.get("status") != config.STATUS_REVEALING:
+            continue
+        order = room.get("reveal_order") or []
+        idx = int(room.get("reveal_index", 0))
+        if 0 <= idx < len(order) and int(order[idx]) == user_id:
+            return room
+    return None
+
+
+async def _reveal_current(bot: Bot, room: dict[str, Any]) -> None:
+    idx = int(room.get("reveal_index", 0))
+    order = [int(x) for x in (room.get("reveal_order") or [])]
+    stories = room.get("reveal_stories") or []
+    if idx < 0 or idx >= len(order) or idx >= len(stories):
+        return
+    reader_id = order[idx]
+    story = stories[idx]
+    players = room.get("players", [])
+    reader = next((p for p in players if int(p["user_id"]) == reader_id), None)
+    reader_label = st.format_user_label(
+        reader_id,
+        reader.get("username") if reader else None,
+    )
+    others = [int(p["user_id"]) for p in players if int(p["user_id"]) != reader_id]
+    await _broadcast(bot, others, f"{reader_label} читает историю, слушаем!")
+    await _safe_send(
+        bot,
+        reader_id,
+        "Тебе выпала честь, прочесть эту легендарную историю! После окончания прочтения нажми на /finish",
+    )
+    await _safe_send(bot, reader_id, story)
+
 
 
 async def main() -> None:

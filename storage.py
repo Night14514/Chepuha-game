@@ -17,6 +17,7 @@ from config import (
     STATUS_FINISHED,
     STATUS_LOBBY,
     STATUS_PLAYING,
+    STATUS_REVEALING,
     TIMEZONE,
     UNKNOWN_USERNAME,
     USERS_FILE,
@@ -224,7 +225,7 @@ def save_rooms(rooms: dict[str, Any]) -> None:
 def get_active_room(rooms: dict[str, Any] | None = None) -> dict[str, Any] | None:
     rooms = rooms if rooms is not None else load_rooms()
     for room in rooms.values():
-        if room.get("status") in (STATUS_LOBBY, STATUS_PLAYING):
+        if room.get("status") in (STATUS_LOBBY, STATUS_PLAYING, STATUS_REVEALING):
             return room
     return None
 
@@ -232,7 +233,7 @@ def get_active_room(rooms: dict[str, Any] | None = None) -> dict[str, Any] | Non
 def find_player_room(user_id: int, rooms: dict[str, Any] | None = None) -> dict[str, Any] | None:
     rooms = rooms if rooms is not None else load_rooms()
     for room in rooms.values():
-        if room.get("status") not in (STATUS_LOBBY, STATUS_PLAYING):
+        if room.get("status") not in (STATUS_LOBBY, STATUS_PLAYING, STATUS_REVEALING):
             continue
         for p in room.get("players", []):
             if int(p["user_id"]) == user_id:
