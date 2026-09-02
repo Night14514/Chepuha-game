@@ -276,10 +276,13 @@ def append_history(
     date: str,
     players: list[dict[str, Any]],
     file_text: str,
+    raw: dict[str, Any] | None = None,
 ) -> Path:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     path = HISTORY_DIR / f"history_{room_id}_{date}.txt"
     path.write_text(file_text, encoding="utf-8")
+    if raw is not None:
+        _write_json(HISTORY_DIR / f"{room_id}_{date}_raw.json", raw)
     index = load_history_index()
     index.append(
         {
@@ -328,3 +331,17 @@ def history_file_path(entry: dict[str, Any]) -> Path | None:
         if path.exists():
             return path
     return None
+
+
+def load_history_raw(entry: dict[str, Any]) -> dict[str, Any] | None:
+    room_id = entry.get("room_id")
+    date = entry.get("date")
+    if not room_id or not date:
+        return None
+    path = HISTORY_DIR / f"{room_id}_{date}_raw.json"
+    if not path.exists():
+        return None
+    data = _read_json(path, None)
+    if not isinstance(data, dict):
+        return None
+    return data

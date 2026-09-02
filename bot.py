@@ -11,7 +11,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, Message, TelegramObject
+from aiogram.types import BufferedInputFile, FSInputFile, Message, ReactionTypeEmoji, TelegramObject
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
 import config
@@ -43,7 +43,7 @@ OWNER_COMMANDS = {
     "players",
 }
 
-HELP_TEXT = """Команды:
+HELP_TEXT_USER = """Команды:
 
 Для всех:
 /start — доступ к боту
@@ -54,7 +54,9 @@ HELP_TEXT = """Команды:
 /get <id> — получить файл истории игры
 /finish — подтвердить, что дочитал историю (только во время чтения)
 /help — этот список
-/cancel — отменить текущий диалог
+/cancel — отменить текущий диалог"""
+
+HELP_TEXT_OWNER = HELP_TEXT_USER + """
 
 Только для создателя:
 /add <user_id> — добавить пользователя
@@ -232,7 +234,42 @@ def _format_questions_by_id() -> str:
     return "\n".join(lines)
 
 
-def _build_history_text(room: dict[str, Any], date: str, assignment: list[tuple[dict, list[str]]]) -> str:
+def _pair_uid(pair: Any) -> int:
+    return int(pair[0])
+
+
+def _pair_text(pair: Any) -> str:
+    return str(pair[1])
+
+
+def _assign_round(pairs: list[list[Any]], stories: list[list[Any]]) -> list[list[Any]]:
+    n = len(pairs)
+    used = [set(_pair_uid(item) for item in slot) for slot in stories]
+    first_round = all(len(s) == 0 for s in used)
+    if first_round or n <= 1:
+        result = list(pairs)
+        random.shuffle(result)
+        return result
+    tries = 30
+    best_penalty: int | None = None
+    best: list[list[list[Any]]] = []
+    for _ in range(tries):
+        cand = list(pairs)
+        random.shuffle(cand)
+        penalty = sum(1 for i, p in enumerate(cand) if _pair_uid(p) in used[i])
+        if best_penalty is None or penalty < best_penalty:
+            best_penalty = penalty
+            best = [cand]
+        elif penalty == best_penalty:
+            best.append(cand)
+    return random.choice(best)
+
+
+def _build_history_text(
+    room: dict[str, Any],
+    date: str,
+    assignment: list[tuple[dict, list]],
+) -> str:
     players_labels = [
         st.format_user_label(int(p["user_id"]), p.get("username"))
         for p in room.get("players", [])
@@ -249,13 +286,68 @@ def _build_history_text(room: dict[str, Any], date: str, assignment: list[tuple[
         chunks.append(f"История {i} (читал: {reader})")
         for q, ans in zip(questions, answers):
             chunks.append(q["text"])
-            chunks.append(ans)
+            chunks.append(_pair_text(ans))
         chunks.append("")
     return "\n".join(chunks).rstrip() + "\n"
 
 
-def _story_text(_questions: list[dict[str, Any]], answers: list[str]) -> str:
-    return "\n".join(answers)
+def _build_history_raw(
+    room: dict[str, Any],
+    date: str,
+    assignment: list[tuple[dict, list]],
+) -> dict[str, Any]:
+    players_by_id = {int(p["user_id"]): p for p in room.get("players", [])}
+    questions = room.get("questions") or st.snapshot_questions()
+    stories_out = []
+    for player, answers in assignment:
+        items = []
+        for q, ans in zip(questions, answers):
+            author_id = _pair_uid(ans)
+            author = players_by_id.get(author_id, {})
+            items.append(
+                {
+                    "question": q["text"],
+                    "text": _pair_text(ans),
+                    "user_id": author_id,
+                    "username": author.get("username") or "",
+                }
+            )
+        stories_out.append(
+            {
+                "reader_user_id": int(player["user_id"]),
+                "reader_username": player.get("username") or "",
+                "answers": items,
+            }
+        )
+    return {
+        "room_id": str(room["id"]),
+        "date": date,
+        "stories": stories_out,
+    }
+
+
+def _history_text_from_raw(raw: dict[str, Any]) -> str:
+    chunks = [
+        f"Игра #{raw.get('room_id')}",
+        f"Дата: {raw.get('date')}",
+        "",
+    ]
+    for i, story in enumerate(raw.get("stories") or [], start=1):
+        reader = st.format_user_label(
+            int(story.get("reader_user_id") or 0),
+            story.get("reader_username"),
+        )
+        chunks.append(f"История {i} (читал: {reader})")
+        for item in story.get("answers") or []:
+            chunks.append(str(item.get("question") or ""))
+            mark = st.format_list_line(int(item.get("user_id") or 0), item.get("username"))
+            chunks.append(f"{item.get('text') or ''} (ответил: {mark})")
+        chunks.append("")
+    return "\n".join(chunks).rstrip() + "\n"
+
+
+def _story_text(answers: list) -> str:
+    return "\n".join(_pair_text(a) for a in answers)
 
 
 # --- commands ---
@@ -273,7 +365,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    user = message.from_user
+    if user and user.id == config.OWNER_ID:
+        await message.answer(HELP_TEXT_OWNER)
+        return
+    await message.answer(HELP_TEXT_USER)
 
 
 @router.message(Command("rules"))
@@ -421,6 +517,14 @@ async def cmd_join(message: Message, command: CommandObject, bot: Bot) -> None:
         st.save_rooms(rooms)
         label = st.format_user_label(user.id, user.username)
         room_id = room["id"]
+    try:
+        await bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji="❤️‍🔥")],
+        )
+    except Exception as e:
+        log.warning("Не удалось поставить реакцию на /join: %s", e)
     await message.answer(
         f"Вы успешно присоединились к комнате {room_id}! Ожидайте начало игры..."
     )
@@ -676,6 +780,14 @@ async def cmd_get(message: Message, command: CommandObject) -> None:
     if not entry or not allowed or path is None:
         await message.answer("История игры не найдена.")
         return
+    if user.id == config.OWNER_ID:
+        raw = st.load_history_raw(entry)
+        if raw:
+            text = _history_text_from_raw(raw)
+            await message.answer_document(
+                BufferedInputFile(text.encode("utf-8"), filename=path.name)
+            )
+            return
     await message.answer_document(FSInputFile(path))
 
 
@@ -766,15 +878,18 @@ async def _advance_round(bot: Bot, room_id: str) -> None:
         players = room.get("players", [])
         answers_map = room.get("answers_this_round") or {}
         try:
-            collected = [answers_map[str(p["user_id"])] for p in players]
+            pairs = [
+                [int(p["user_id"]), answers_map[str(p["user_id"])]]
+                for p in players
+            ]
         except KeyError:
             return
-        random.shuffle(collected)
         stories = room.setdefault("stories", [[] for _ in players])
         while len(stories) < len(players):
             stories.append([])
-        for i, ans in enumerate(collected):
-            stories[i].append(ans)
+        assigned = _assign_round(pairs, stories)
+        for i, pair in enumerate(assigned):
+            stories[i].append(pair)
         idx = int(room.get("current_question_index", 0))
         questions = room.get("questions") or st.snapshot_questions()
         if idx + 1 >= len(questions):
@@ -795,19 +910,23 @@ async def _advance_round(bot: Bot, room_id: str) -> None:
 def _close_room(rooms: dict[str, Any], room: dict[str, Any]) -> dict[str, Any]:
     players = list(room.get("players", []))
     stories = list(room.get("stories", []))
-    questions = room.get("questions") or st.snapshot_questions()
-    order = list(range(len(players)))
-    random.shuffle(order)
-    assignment: list[tuple[dict, list[str]]] = []
+    story_order = list(range(len(players)))
+    random.shuffle(story_order)
+    assignment: list[tuple[dict, list]] = []
     for i, player in enumerate(players):
-        assignment.append((player, stories[order[i]]))
+        assignment.append((player, stories[story_order[i]]))
+    random.shuffle(assignment)
+    if len(assignment) > 1 and int(assignment[0][0]["user_id"]) == config.OWNER_ID:
+        swap_with = random.randint(1, len(assignment) - 1)
+        assignment[0], assignment[swap_with] = assignment[swap_with], assignment[0]
     date = st.today_str()
     history_text = _build_history_text(room, date, assignment)
-    st.append_history(str(room["id"]), date, players, history_text)
+    raw = _build_history_raw(room, date, assignment)
+    st.append_history(str(room["id"]), date, players, history_text, raw=raw)
     room["status"] = config.STATUS_REVEALING
     room["answers_this_round"] = {}
     room["reveal_order"] = [int(player["user_id"]) for player, _ in assignment]
-    room["reveal_stories"] = [_story_text(questions, answers) for _, answers in assignment]
+    room["reveal_stories"] = [_story_text(answers) for _, answers in assignment]
     room["reveal_index"] = 0
     st.save_rooms(rooms)
     return room
