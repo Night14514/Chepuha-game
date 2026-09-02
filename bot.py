@@ -15,6 +15,7 @@ from aiogram.types import BufferedInputFile, FSInputFile, Message, ReactionTypeE
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
 import config
+import git_sync
 import storage as st
 
 logging.basicConfig(
@@ -41,6 +42,7 @@ OWNER_COMMANDS = {
     "game",
     "stop",
     "players",
+    "save",
 }
 
 HELP_TEXT_USER = """Команды:
@@ -69,7 +71,8 @@ HELP_TEXT_OWNER = HELP_TEXT_USER + """
 /edit_qu — изменить текст вопросов
 /game — начать игру
 /stop — остановить игру или отменить комнату
-/players — игроки в текущей комнате"""
+/players — игроки в текущей комнате
+/save — сохранить users.txt в GitHub"""
 
 RULES_TEXT = """Правила игры «Чепуха»
 
@@ -123,6 +126,16 @@ class NotInPlayingGame(Filter):
 room_lock = asyncio.Lock()
 router = Router()
 router.message.filter(F.chat.type == "private")
+router.edited_message.filter(F.chat.type == "private")
+
+CHUGUN_PHRASES = [
+    "Опять чугун... Почему не алюминий?",
+    "Чугун? Иди потрогай траву",
+    "А я тут причем?",
+    "Чугун? Почему не урановая шахта?",
+    "Ну ты и любитель чугуна",
+]
+_chugun_bag: list[str] = []
 
 
 def _cmd_name(message: Message) -> str | None:
@@ -232,6 +245,30 @@ def _format_questions_by_id() -> str:
         text = cfg["texts"].get(str(num), "")
         lines.append(f"{num}. {text}")
     return "\n".join(lines)
+
+
+def _round_answer_text(val: Any) -> str:
+    if isinstance(val, dict):
+        return str(val.get("text") or "")
+    return str(val)
+
+
+def _has_chugun(text: str) -> bool:
+    return "чугун" in (text or "").lower()
+
+
+def _next_chugun_phrase() -> str:
+    global _chugun_bag
+    if not _chugun_bag:
+        _chugun_bag = list(CHUGUN_PHRASES)
+        random.shuffle(_chugun_bag)
+    return _chugun_bag.pop()
+
+
+def _ack_for_answer(text: str) -> str:
+    if _has_chugun(text):
+        return _next_chugun_phrase()
+    return "Ответ засчитан, ожидайте ответа других игроков..."
 
 
 def _pair_uid(pair: Any) -> int:
@@ -598,6 +635,12 @@ async def cmd_players(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
+@router.message(Command("save"))
+async def cmd_save(message: Message) -> None:
+    result = await asyncio.to_thread(git_sync.sync_users_file)
+    await message.answer(result.detail)
+
+
 @router.message(Command("edit"))
 async def cmd_edit(message: Message, state: FSMContext) -> None:
     room = st.get_active_room()
@@ -856,14 +899,58 @@ async def on_answer(message: Message, bot: Bot, state: FSMContext) -> None:
                 f"Ответ слишком длинный. Сократите до {config.MAX_ANSWER_LENGTH} символов и отправьте заново."
             )
             return
-        already[uid_key] = text
+        ack = _ack_for_answer(text)
+        already[uid_key] = {
+            "text": text,
+            "message_id": message.message_id,
+            "round_index": int(room.get("current_question_index", 0)),
+        }
         st.save_rooms(rooms)
         n_players = len(room.get("players", []))
         n_answers = len(already)
         round_complete = n_answers >= n_players
-    await message.answer("Ответ засчитан, ожидайте ответа других игроков...")
+        room_id = room["id"]
+    await message.answer(ack)
     if round_complete:
-        await _advance_round(bot, room["id"])
+        await _advance_round(bot, room_id)
+
+
+@router.edited_message(F.text, ~F.text.startswith("/"))
+async def on_answer_edited(message: Message) -> None:
+    user = message.from_user
+    if user is None:
+        return
+    text = (message.text or "").strip()
+    ack: str | None = None
+    async with room_lock:
+        rooms = st.load_rooms()
+        room = st.find_player_room(user.id, rooms)
+        if not room or room.get("status") != config.STATUS_PLAYING:
+            return
+        uid_key = str(user.id)
+        already = room.setdefault("answers_this_round", {})
+        entry = already.get(uid_key)
+        if not isinstance(entry, dict):
+            return
+        if int(entry.get("message_id") or 0) != message.message_id:
+            return
+        if int(entry.get("round_index") or -1) != int(room.get("current_question_index", 0)):
+            return
+        if len(text) > config.MAX_ANSWER_LENGTH:
+            ack = (
+                f"Отредактированный ответ слишком длинный "
+                f"(максимум {config.MAX_ANSWER_LENGTH} символов), "
+                "сохранён прежний вариант ответа."
+            )
+        else:
+            entry["text"] = text
+            st.save_rooms(rooms)
+            if _has_chugun(text):
+                ack = _next_chugun_phrase()
+            else:
+                ack = "Ответ обновлён, ожидайте ответа других игроков..."
+    if ack:
+        await message.answer(ack)
 
 
 async def _advance_round(bot: Bot, room_id: str) -> None:
@@ -879,7 +966,7 @@ async def _advance_round(bot: Bot, room_id: str) -> None:
         answers_map = room.get("answers_this_round") or {}
         try:
             pairs = [
-                [int(p["user_id"]), answers_map[str(p["user_id"])]]
+                [int(p["user_id"]), _round_answer_text(answers_map[str(p["user_id"])])]
                 for p in players
             ]
         except KeyError:
@@ -979,6 +1066,7 @@ async def main() -> None:
     bot = Bot(token=config.BOT_TOKEN)
     dp = Dispatcher()
     dp.message.middleware(AccessMiddleware())
+    dp.edited_message.middleware(AccessMiddleware())
     dp.include_router(router)
     log.info("Бот «Чепуха» запущен, owner_id=%s", config.OWNER_ID)
     await dp.start_polling(bot)
