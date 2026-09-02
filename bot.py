@@ -637,7 +637,7 @@ async def cmd_players(message: Message) -> None:
 
 @router.message(Command("save"))
 async def cmd_save(message: Message) -> None:
-    result = await asyncio.to_thread(git_sync.sync_users_file)
+    result = await git_sync.sync_users_file()
     await message.answer(result.detail)
 
 
