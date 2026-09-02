@@ -174,7 +174,7 @@ async def sync_users_file() -> SyncResult:
             payload = {
                 "message": commit_message,
                 "content": new_content_b64,
-                "branch": "main",
+                "branch": "master",
             }
             if current_sha:
                 payload["sha"] = current_sha
