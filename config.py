@@ -15,6 +15,7 @@ GIT_AUTHOR_NAME = os.environ.get("GIT_AUTHOR_NAME", "Chepuha Bot")
 GIT_AUTHOR_EMAIL = os.environ.get("GIT_AUTHOR_EMAIL", "bot@chepuha.local")
 
 USERS_FILE = BASE_DIR / "users.txt"
+ADMINS_FILE = BASE_DIR / "admins.txt"
 ROOMS_FILE = BASE_DIR / "rooms.json"
 QUESTIONS_FILE = BASE_DIR / "questions_config.json"
 HISTORY_DIR = BASE_DIR / "history"

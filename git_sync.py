@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import base64
 import logging
-import os
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
+
+import httpx
 
 import config
 
@@ -15,8 +16,9 @@ log = logging.getLogger("chepuha.git")
 
 Status = Literal["no_changes", "pushed", "error"]
 
-USERS_REL = "users.txt"
-PUSH_REMOTE = "https://github.com/Night14514/Chepuha-game.git"
+GITHUB_OWNER = "Night14514"
+GITHUB_REPO = "Chepuha-game"
+GITHUB_API_BASE = "https://api.github.com"
 
 
 @dataclass
@@ -27,7 +29,7 @@ class SyncResult:
 
 def _mask(text: str) -> str:
     token = config.GITHUB_TOKEN or ""
-    if token:
+    if token and len(token) > 10:
         return (text or "").replace(token, "***")
     return text or ""
 
@@ -39,197 +41,192 @@ def _clip(text: str, limit: int = 300) -> str:
     return text[: limit - 1] + "…"
 
 
-def _repo() -> Path:
-    return Path(config.GIT_REPO_PATH)
-
-
-def _run(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
-
-
-def _classify_push_error(stderr: str) -> str:
-    low = (stderr or "").lower()
-    if any(
-        marker in low
-        for marker in (
-            "401",
-            "403",
-            "permission denied",
-            "authentication failed",
-            "invalid username",
-            "could not read username",
-        )
-    ):
-        return (
-            "Ошибка доступа к репозиторию: проверьте, что GITHUB_TOKEN "
-            "действителен и имеет права на запись."
-        )
-    if any(
-        marker in low
-        for marker in (
-            "non-fast-forward",
-            "failed to push some refs",
-            "updates were rejected",
-            "[rejected]",
-        )
-    ):
-        return (
-            "Локальная копия отстала от GitHub, автоматический пуш отменён "
-            "во избежание конфликта. Изменения сохранены локальным коммитом, "
-            "нужна ручная синхронизация."
-        )
-    reason = _clip(_mask(stderr)) or "неизвестная ошибка"
-    return f"Не удалось сохранить users.txt в GitHub: {reason}."
-
-
-def sync_users_file() -> SyncResult:
-    repo = _repo()
-    try:
-        inside = _run(
-            ["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"],
-            timeout=15,
-        )
-    except FileNotFoundError:
-        log.error("Git binary not found")
-        return SyncResult(
-            "error",
-            "Репозиторий не найден на сервере, обратитесь к администратору хостинга.",
-        )
-    except subprocess.TimeoutExpired:
-        log.error("git rev-parse timed out")
-        return SyncResult(
-            "error",
-            "Не удалось связаться с GitHub (таймаут). Попробуйте позже.",
-        )
-    if inside.returncode != 0 or (inside.stdout or "").strip() != "true":
-        log.error("Not a git repo: %s", _mask(inside.stderr))
-        return SyncResult(
-            "error",
-            "Репозиторий не найден на сервере, обратитесь к администратору хостинга.",
-        )
-
-    try:
-        status = _run(
-            ["git", "-C", str(repo), "status", "--porcelain", "--", USERS_REL],
-            timeout=15,
-        )
-    except subprocess.TimeoutExpired:
-        log.error("git status timed out")
-        return SyncResult(
-            "error",
-            "Не удалось связаться с GitHub (таймаут). Попробуйте позже.",
-        )
-    if status.returncode != 0:
-        log.error("git status failed: %s", _mask(status.stderr))
-        return SyncResult(
-            "error",
-            f"Не удалось сохранить users.txt в GitHub: {_clip(_mask(status.stderr)) or 'ошибка git status'}.",
-        )
-    if not (status.stdout or "").strip():
-        return SyncResult("no_changes", "Изменений в users.txt нет, пушить нечего.")
-
-    try:
-        added = _run(["git", "-C", str(repo), "add", USERS_REL], timeout=15)
-    except subprocess.TimeoutExpired:
-        log.error("git add timed out")
-        return SyncResult(
-            "error",
-            "Не удалось связаться с GitHub (таймаут). Попробуйте позже.",
-        )
-    if added.returncode != 0:
-        log.error("git add failed: %s", _mask(added.stderr))
-        return SyncResult(
-            "error",
-            f"Не удалось сохранить users.txt в GitHub: {_clip(_mask(added.stderr)) or 'ошибка git add'}.",
-        )
-
-    stamp = datetime.now(ZoneInfo(config.TIMEZONE)).isoformat(timespec="seconds")
-    message = f"users.txt: автосохранение {stamp}"
-    try:
-        committed = _run(
-            [
-                "git",
-                "-C",
-                str(repo),
-                "-c",
-                f"user.name={config.GIT_AUTHOR_NAME}",
-                "-c",
-                f"user.email={config.GIT_AUTHOR_EMAIL}",
-                "commit",
-                "-m",
-                message,
-            ],
-            timeout=20,
-        )
-    except subprocess.TimeoutExpired:
-        log.error("git commit timed out")
-        return SyncResult(
-            "error",
-            "Не удалось связаться с GitHub (таймаут). Попробуйте позже.",
-        )
-    if committed.returncode != 0:
-        log.error("git commit failed: %s", _mask(committed.stderr or committed.stdout))
-        return SyncResult(
-            "error",
-            f"Не удалось сохранить users.txt в GitHub: {_clip(_mask(committed.stderr or committed.stdout)) or 'ошибка git commit'}.",
-        )
-
-    try:
-        branch_p = _run(
-            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
-            timeout=15,
-        )
-        short_p = _run(
-            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
-            timeout=15,
-        )
-    except subprocess.TimeoutExpired:
-        log.error("git rev-parse timed out after commit")
-        return SyncResult(
-            "error",
-            "Не удалось связаться с GitHub (таймаут). Попробуйте позже.",
-        )
-    branch = (branch_p.stdout or "").strip()
-    short_hash = (short_p.stdout or "").strip()
-    if not branch or branch == "HEAD":
-        log.error("Could not determine branch: %s", _mask(branch_p.stderr))
-        return SyncResult(
-            "error",
-            "Не удалось сохранить users.txt в GitHub: не удалось определить текущую ветку.",
-        )
-
+def _check_token() -> bool:
     token = config.GITHUB_TOKEN or ""
     if not token:
         log.error("GITHUB_TOKEN is empty")
+        return False
+    if len(token) < 20:
+        log.error("GITHUB_TOKEN looks invalid (too short)")
+        return False
+    return True
+
+
+async def _sync_file(local_path: Path, repo_filename: str) -> SyncResult:
+    if not _check_token():
         return SyncResult(
             "error",
             "Ошибка доступа к репозиторию: проверьте, что GITHUB_TOKEN действителен и имеет права на запись.",
         )
 
-    push_url = f"https://{token}@{PUSH_REMOTE.removeprefix('https://')}"
     try:
-        pushed = _run(
-            ["git", "-C", str(repo), "push", push_url, branch],
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        log.error("Git push failed: timeout")
+        local_content = local_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        log.error("%s not found at %s", repo_filename, local_path)
         return SyncResult(
             "error",
-            "Не удалось связаться с GitHub (таймаут). Попробуйте позже.",
+            f"Файл {repo_filename} не найден на сервере, обратитесь к администратору хостинга.",
         )
-    if pushed.returncode != 0:
-        stderr_safe = _mask(pushed.stderr or pushed.stdout)
-        log.error("Git push failed: %s", stderr_safe)
-        return SyncResult("error", _classify_push_error(pushed.stderr or pushed.stdout))
+    except Exception as e:
+        log.error("Failed to read %s: %s", repo_filename, e)
+        return SyncResult(
+            "error",
+            f"Не удалось прочитать {repo_filename}: {_clip(str(e))}.",
+        )
 
-    extra = f" ({short_hash})" if short_hash else ""
-    return SyncResult("pushed", f"users.txt сохранён и отправлен в GitHub.{extra}")
+    api_url = f"{GITHUB_API_BASE}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{repo_filename}"
+    headers = {
+        "Authorization": f"token {config.GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            log.info("Fetching current %s state from GitHub...", repo_filename)
+            try:
+                resp = await client.get(api_url, headers=headers)
+            except httpx.TimeoutException:
+                log.error("Timeout fetching file from GitHub")
+                return SyncResult(
+                    "error",
+                    "Не удалось связаться с GitHub (таймаут). Попробуйте позже.",
+                )
+            except httpx.RequestError as e:
+                log.error("Request error fetching file: %s", e)
+                return SyncResult(
+                    "error",
+                    "Не удалось связаться с GitHub. Попробуйте позже.",
+                )
+
+            current_sha = None
+            current_content = ""
+
+            if resp.status_code == 200:
+                data = resp.json()
+                current_sha = data.get("sha")
+                try:
+                    current_content = base64.b64decode(data.get("content", "")).decode(
+                        "utf-8"
+                    )
+                except Exception as e:
+                    log.error("Failed to decode current file content: %s", e)
+                    current_content = ""
+                if local_content == current_content:
+                    log.info("%s hasn't changed", repo_filename)
+                    return SyncResult(
+                        "no_changes",
+                        f"Изменений в {repo_filename} нет, пушить нечего.",
+                    )
+            elif resp.status_code == 404:
+                log.info("%s doesn't exist in repo yet, will create", repo_filename)
+                current_sha = None
+            elif resp.status_code in (401, 403):
+                log.error("GitHub auth failed: %s", resp.status_code)
+                return SyncResult(
+                    "error",
+                    "Ошибка доступа к репозиторию: проверьте, что GITHUB_TOKEN действителен и имеет права на запись.",
+                )
+            else:
+                log.error("GitHub API error: %s %s", resp.status_code, _mask(resp.text))
+                return SyncResult(
+                    "error",
+                    f"Не удалось проверить {repo_filename} на GitHub: {resp.status_code}.",
+                )
+
+            new_content_b64 = base64.b64encode(local_content.encode("utf-8")).decode(
+                "utf-8"
+            )
+            stamp = datetime.now(ZoneInfo(config.TIMEZONE)).isoformat(timespec="seconds")
+            payload = {
+                "message": f"{repo_filename}: автосохранение {stamp}",
+                "content": new_content_b64,
+                "branch": "master",
+            }
+            if current_sha:
+                payload["sha"] = current_sha
+
+            log.info("Pushing %s to GitHub...", repo_filename)
+            try:
+                resp = await client.put(api_url, headers=headers, json=payload)
+            except httpx.TimeoutException:
+                log.error("Timeout pushing to GitHub")
+                return SyncResult(
+                    "error",
+                    "Не удалось связаться с GitHub (таймаут). Попробуйте позже.",
+                )
+            except httpx.RequestError as e:
+                log.error("Request error pushing: %s", e)
+                return SyncResult(
+                    "error",
+                    "Не удалось связаться с GitHub. Попробуйте позже.",
+                )
+
+            if resp.status_code in (200, 201):
+                try:
+                    data = resp.json()
+                    commit_sha = data.get("commit", {}).get("sha", "")[:7]
+                    log.info("Successfully pushed %s (%s)", repo_filename, commit_sha)
+                    extra = f" ({commit_sha})" if commit_sha else ""
+                    return SyncResult(
+                        "pushed",
+                        f"{repo_filename} сохранён и отправлен в GitHub.{extra}",
+                    )
+                except Exception as e:
+                    log.error("Failed to parse push response: %s", e)
+                    return SyncResult(
+                        "pushed",
+                        f"{repo_filename} сохранён и отправлен в GitHub.",
+                    )
+
+            if resp.status_code in (401, 403):
+                log.error("GitHub auth failed on push: %s", resp.status_code)
+                return SyncResult(
+                    "error",
+                    "Ошибка доступа к репозиторию: проверьте, что GITHUB_TOKEN действителен и имеет права на запись.",
+                )
+
+            if resp.status_code == 422:
+                log.error("GitHub push rejected: %s", resp.status_code)
+                try:
+                    error_data = resp.json()
+                    message = error_data.get("message", "")
+                    if "reference update refused" in message.lower() or "non-fast" in message.lower():
+                        return SyncResult(
+                            "error",
+                            "Локальная копия отстала от GitHub, автоматический пуш отменён "
+                            "во избежание конфликта. Изменения сохранены локальным коммитом, "
+                            "нужна ручная синхронизация.",
+                        )
+                except Exception:
+                    pass
+                return SyncResult(
+                    "error",
+                    f"Не удалось сохранить {repo_filename} в GitHub: конфликт версий.",
+                )
+
+            log.error(
+                "GitHub API error on push: %s %s",
+                resp.status_code,
+                _mask(resp.text),
+            )
+            reason = _clip(_mask(resp.text)) or "неизвестная ошибка"
+            return SyncResult(
+                "error",
+                f"Не удалось сохранить {repo_filename} в GitHub: {reason}.",
+            )
+
+    except Exception as e:
+        log.error("Unexpected error in _sync_file: %s", e)
+        return SyncResult(
+            "error",
+            f"Неожиданная ошибка: {_clip(str(e))}.",
+        )
+
+
+async def sync_users_file() -> SyncResult:
+    return await _sync_file(config.USERS_FILE, "users.txt")
+
+
+async def sync_admins_file() -> SyncResult:
+    return await _sync_file(config.ADMINS_FILE, "admins.txt")

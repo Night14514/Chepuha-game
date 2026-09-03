@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import random
 import sys
@@ -28,21 +29,28 @@ MSG_DENIED = (
     "Вы не добавлены в список участников игры, для добавления пишите в лс @enotdev"
 )
 MSG_OWNER_ONLY = "Эта команда доступна только создателю."
+MSG_ADMIN_ONLY = "Эта команда доступна только создателю или администраторам."
 MSG_USAGE_HELP = "Список команд: /help"
 
 OWNER_COMMANDS = {
-    "add",
-    "delete",
     "list",
     "rooms",
-    "create",
-    "exc",
     "edit",
     "edit_qu",
+    "save",
+    "grand",
+    "unadmin",
+    "admins",
+}
+
+ADMIN_COMMANDS = {
+    "add",
+    "delete",
+    "create",
+    "exc",
     "game",
     "stop",
     "players",
-    "save",
 }
 
 HELP_TEXT_USER = """Команды:
@@ -58,6 +66,17 @@ HELP_TEXT_USER = """Команды:
 /help — этот список
 /cancel — отменить текущий диалог"""
 
+HELP_TEXT_ADMIN = HELP_TEXT_USER + """
+
+Команды администратора:
+/add <user_id> — добавить пользователя
+/delete <username или user_id> — удалить из списка
+/create — создать комнату
+/exc <username или user_id> — исключить из комнаты (только лобби)
+/game — начать игру
+/stop — остановить игру или отменить комнату
+/players — игроки в текущей комнате"""
+
 HELP_TEXT_OWNER = HELP_TEXT_USER + """
 
 Только для создателя:
@@ -72,7 +91,10 @@ HELP_TEXT_OWNER = HELP_TEXT_USER + """
 /game — начать игру
 /stop — остановить игру или отменить комнату
 /players — игроки в текущей комнате
-/save — сохранить users.txt в GitHub"""
+/save — сохранить users.txt в GitHub
+/grand <user_id или username> — выдать права админа
+/unadmin <user_id или username> — снять права админа
+/admins — список администраторов"""
 
 RULES_TEXT = """Правила игры «Чепуха»
 
@@ -153,12 +175,16 @@ class AccessMiddleware(BaseMiddleware):
             return await handler(event, data)
         user = event.from_user
         st.touch_user(user.id, user.username, user.first_name or "")
+        st.touch_admin(user.id, user.username, user.first_name or "")
         cmd = _cmd_name(event)
         if cmd and not st.is_authorized(user.id, config.OWNER_ID):
             await event.answer(MSG_DENIED)
             return None
         if cmd in OWNER_COMMANDS and user.id != config.OWNER_ID:
             await event.answer(MSG_OWNER_ONLY)
+            return None
+        if cmd in ADMIN_COMMANDS and user.id != config.OWNER_ID and not st.is_admin(user.id):
+            await event.answer(MSG_ADMIN_ONLY)
             return None
         return await handler(event, data)
 
@@ -391,8 +417,18 @@ def _story_text(answers: list) -> str:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
+async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
+    user = message.from_user
+    if user and st.find_user_row(str(user.id)):
+        try:
+            await bot.set_message_reaction(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                reaction=[ReactionTypeEmoji(emoji="⚡")],
+            )
+        except Exception as e:
+            log.warning("Не удалось поставить реакцию на /start: %s", e)
     await message.answer(
         "Добро пожаловать в игру «Чепуха».\n"
         "Правила: /rules\n"
@@ -406,12 +442,18 @@ async def cmd_help(message: Message) -> None:
     if user and user.id == config.OWNER_ID:
         await message.answer(HELP_TEXT_OWNER)
         return
+    if user and st.is_admin(user.id):
+        await message.answer(HELP_TEXT_ADMIN)
+        return
     await message.answer(HELP_TEXT_USER)
 
 
 @router.message(Command("rules"))
 async def cmd_rules(message: Message) -> None:
-    await message.answer(RULES_TEXT)
+    await message.answer(
+        f"<blockquote>{html.escape(RULES_TEXT)}</blockquote>",
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("cancel"))
@@ -443,6 +485,10 @@ async def cmd_delete(message: Message, command: CommandObject) -> None:
     if not args:
         await message.answer(_usage("/delete", "<username или user_id>"))
         return
+    row = st.find_user_row(args)
+    if row and int(row["user_id"]) == config.OWNER_ID:
+        await message.answer("Нельзя удалить владельца из списка.")
+        return
     if not st.delete_user(args):
         await message.answer("Пользователь не найден в списке.")
         return
@@ -452,6 +498,7 @@ async def cmd_delete(message: Message, command: CommandObject) -> None:
 @router.message(Command("list"))
 async def cmd_list(message: Message) -> None:
     rows = st.load_users()
+    admin_ids = {int(a["user_id"]) for a in st.load_admins()}
     lines: list[str] = []
     owner_in_list = False
     for r in rows:
@@ -459,7 +506,14 @@ async def cmd_list(message: Message) -> None:
         is_owner = uid == config.OWNER_ID
         if is_owner:
             owner_in_list = True
-        lines.append(st.format_list_line(uid, r.get("username"), is_owner=is_owner))
+        lines.append(
+            st.format_list_line(
+                uid,
+                r.get("username"),
+                is_owner=is_owner,
+                is_admin=(uid in admin_ids and not is_owner),
+            )
+        )
     if not owner_in_list and config.OWNER_ID:
         lines.insert(0, st.format_list_line(config.OWNER_ID, None, is_owner=True))
     if not lines:
@@ -467,6 +521,74 @@ async def cmd_list(message: Message) -> None:
         return
     numbered = "\n".join(f"{i}. {line}" for i, line in enumerate(lines, start=1))
     await message.answer(numbered)
+
+
+@router.message(Command("admins"))
+async def cmd_admins(message: Message) -> None:
+    rows = st.load_admins()
+    if not rows:
+        await message.answer("Список администраторов пуст.")
+        return
+    lines = []
+    for i, r in enumerate(rows, start=1):
+        lines.append(
+            f"{i}. {st.format_list_line(int(r['user_id']), r.get('username'), is_admin=True)}"
+        )
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("grand"))
+async def cmd_grand(message: Message, command: CommandObject, bot: Bot) -> None:
+    args = (command.args or "").strip()
+    if not args:
+        await message.answer(_usage("/grand", "<user_id или username>"))
+        return
+    q = args.lstrip("@")
+    if q.isdigit():
+        user_id = int(q)
+        row = st.find_user_row(q) or st.find_admin_row(q)
+        username = (row.get("username") if row else "") or config.UNKNOWN_USERNAME
+        first_name = (row.get("first_name") if row else "") or ""
+    else:
+        row = st.find_user_row(args) or st.find_admin_row(args)
+        if not row:
+            await message.answer(
+                "Пользователь с таким username не найден. "
+                "Сначала добавьте его через /add, либо укажите числовой user_id."
+            )
+            return
+        user_id = int(row["user_id"])
+        username = row.get("username") or config.UNKNOWN_USERNAME
+        first_name = row.get("first_name") or ""
+    if user_id == config.OWNER_ID:
+        await message.answer("Владелец не может быть админом — он и так выше по правам.")
+        return
+    if st.is_admin(user_id):
+        await message.answer("Пользователь уже является админом.")
+        return
+    st.add_admin(user_id, username, first_name or "")
+    label = st.format_user_label(user_id, username)
+    await message.answer(f"Пользователь {label} назначен админом.")
+    await _safe_send(
+        bot,
+        user_id,
+        "Вы назначены админом, напишите /help чтобы увидеть список доступных команд",
+    )
+
+
+@router.message(Command("unadmin"))
+async def cmd_unadmin(message: Message, command: CommandObject) -> None:
+    args = (command.args or "").strip()
+    if not args:
+        await message.answer(_usage("/unadmin", "<user_id или username>"))
+        return
+    row = st.find_admin_row(args)
+    if not row:
+        await message.answer("Этот пользователь не является админом.")
+        return
+    st.remove_admin(args)
+    label = st.format_user_label(int(row["user_id"]), row.get("username"))
+    await message.answer(f"Права админа сняты с {label}.")
 
 
 @router.message(Command("rooms"))
@@ -610,6 +732,9 @@ async def cmd_exc(message: Message, command: CommandObject, bot: Bot) -> None:
             await message.answer("Игрок не найден в комнате.")
             return
         uid = int(player["user_id"])
+        if uid == config.OWNER_ID:
+            await message.answer("Нельзя исключить владельца из комнаты.")
+            return
         room["players"] = [p for p in room["players"] if int(p["user_id"]) != uid]
         st.save_rooms(rooms)
         room_id = room["id"]
@@ -637,8 +762,11 @@ async def cmd_players(message: Message) -> None:
 
 @router.message(Command("save"))
 async def cmd_save(message: Message) -> None:
-    result = await asyncio.to_thread(git_sync.sync_users_file)
-    await message.answer(result.detail)
+    users_result = await git_sync.sync_users_file()
+    admins_result = await git_sync.sync_admins_file()
+    await message.answer(
+        f"users.txt: {users_result.detail}\nadmins.txt: {admins_result.detail}"
+    )
 
 
 @router.message(Command("edit"))
@@ -814,7 +942,7 @@ async def cmd_get(message: Message, command: CommandObject) -> None:
     entry = st.get_history_entry(args)
     allowed = False
     if entry:
-        if user.id == config.OWNER_ID:
+        if user.id == config.OWNER_ID or st.is_admin(user.id):
             allowed = True
         else:
             ids = [int(p["user_id"]) for p in entry.get("players", [])]
@@ -823,7 +951,7 @@ async def cmd_get(message: Message, command: CommandObject) -> None:
     if not entry or not allowed or path is None:
         await message.answer("История игры не найдена.")
         return
-    if user.id == config.OWNER_ID:
+    if user.id == config.OWNER_ID or st.is_admin(user.id):
         raw = st.load_history_raw(entry)
         if raw:
             text = _history_text_from_raw(raw)
@@ -863,6 +991,14 @@ async def cmd_finish(message: Message, bot: Bot) -> None:
     if error:
         await message.answer(error)
         return
+    try:
+        await bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji="❤️")],
+        )
+    except Exception as e:
+        log.warning("Не удалось поставить реакцию на /finish: %s", e)
     if next_room:
         await _reveal_current(bot, next_room)
         return

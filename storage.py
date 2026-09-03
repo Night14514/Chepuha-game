@@ -21,6 +21,7 @@ from config import (
     TIMEZONE,
     UNKNOWN_USERNAME,
     USERS_FILE,
+    ADMINS_FILE,
 )
 
 
@@ -54,6 +55,8 @@ def _field(value: str | None) -> str:
 def ensure_files() -> None:
     if not USERS_FILE.exists():
         USERS_FILE.write_text("", encoding="utf-8")
+    if not ADMINS_FILE.exists():
+        ADMINS_FILE.write_text("", encoding="utf-8")
     if not ROOMS_FILE.exists():
         _write_json(ROOMS_FILE, {})
     if not QUESTIONS_FILE.exists():
@@ -77,7 +80,12 @@ def format_user_label(user_id: int, username: str | None) -> str:
     return f"id: {user_id} (username отсутствует)"
 
 
-def format_list_line(user_id: int, username: str | None, is_owner: bool = False) -> str:
+def format_list_line(
+    user_id: int,
+    username: str | None,
+    is_owner: bool = False,
+    is_admin: bool = False,
+) -> str:
     uname = username.lstrip("@") if username and username not in ("", UNKNOWN_USERNAME) else None
     if uname:
         line = f"@{uname} (id: {user_id})"
@@ -85,6 +93,8 @@ def format_list_line(user_id: int, username: str | None, is_owner: bool = False)
         line = f"id: {user_id} (username отсутствует)"
     if is_owner:
         line += " (создатель)"
+    elif is_admin:
+        line += " (админ)"
     return line
 
 
@@ -117,6 +127,8 @@ def save_users(rows: list[dict[str, str]]) -> None:
 
 def is_authorized(user_id: int, owner_id: int) -> bool:
     if user_id == owner_id:
+        return True
+    if is_admin(user_id):
         return True
     return any(int(r["user_id"]) == user_id for r in load_users())
 
@@ -174,6 +186,98 @@ def touch_user(user_id: int, username: str | None, first_name: str | None) -> No
 def find_user_row(query: str) -> dict[str, str] | None:
     q = query.strip().lstrip("@")
     for r in load_users():
+        if q.isdigit() and r["user_id"] == q:
+            return r
+        stored = (r.get("username") or "").lstrip("@")
+        if not q.isdigit() and stored.lower() == q.lower() and stored not in ("", UNKNOWN_USERNAME):
+            return r
+    return None
+
+
+# --- admins.txt ---
+
+
+def load_admins() -> list[dict[str, str]]:
+    ensure_files()
+    rows: list[dict[str, str]] = []
+    text = ADMINS_FILE.read_text(encoding="utf-8")
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(";", 2)
+        user_id = parts[0].strip()
+        username = parts[1].strip() if len(parts) > 1 else UNKNOWN_USERNAME
+        first_name = parts[2] if len(parts) > 2 else ""
+        rows.append({"user_id": user_id, "username": username, "first_name": first_name})
+    return rows
+
+
+def save_admins(rows: list[dict[str, str]]) -> None:
+    lines = [
+        f"{_field(r['user_id'])};{_field(r.get('username') or UNKNOWN_USERNAME)};{_field(r.get('first_name'))}"
+        for r in rows
+    ]
+    _write_text(ADMINS_FILE, "\n".join(lines) + ("\n" if lines else ""))
+
+
+def is_admin(user_id: int) -> bool:
+    return any(int(r["user_id"]) == user_id for r in load_admins())
+
+
+def add_admin(user_id: int, username: str = UNKNOWN_USERNAME, first_name: str = "") -> bool:
+    rows = load_admins()
+    if any(int(r["user_id"]) == user_id for r in rows):
+        return False
+    rows.append(
+        {
+            "user_id": str(user_id),
+            "username": username or UNKNOWN_USERNAME,
+            "first_name": first_name or "",
+        }
+    )
+    save_admins(rows)
+    return True
+
+
+def remove_admin(query: str) -> bool:
+    rows = load_admins()
+    q = query.strip().lstrip("@")
+    remaining: list[dict[str, str]] = []
+    found = False
+    for r in rows:
+        if q.isdigit() and r["user_id"] == q:
+            found = True
+            continue
+        stored = (r.get("username") or "").lstrip("@")
+        if not q.isdigit() and stored.lower() == q.lower() and stored not in ("", UNKNOWN_USERNAME):
+            found = True
+            continue
+        remaining.append(r)
+    if found:
+        save_admins(remaining)
+    return found
+
+
+def touch_admin(user_id: int, username: str | None, first_name: str | None) -> None:
+    rows = load_admins()
+    changed = False
+    new_username = username or UNKNOWN_USERNAME
+    new_first = first_name or ""
+    for r in rows:
+        if int(r["user_id"]) == user_id:
+            if r.get("username") != new_username or r.get("first_name") != new_first:
+                r["username"] = new_username
+                r["first_name"] = new_first
+                changed = True
+            break
+    if changed:
+        save_admins(rows)
+
+
+def find_admin_row(query: str) -> dict[str, str] | None:
+    q = query.strip().lstrip("@")
+    for r in load_admins():
         if q.isdigit() and r["user_id"] == q:
             return r
         stored = (r.get("username") or "").lstrip("@")
