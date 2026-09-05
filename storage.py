@@ -381,6 +381,7 @@ def append_history(
     players: list[dict[str, Any]],
     file_text: str,
     raw: dict[str, Any] | None = None,
+    mode: str = "V1",
 ) -> Path:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     path = HISTORY_DIR / f"history_{room_id}_{date}.txt"
@@ -392,6 +393,7 @@ def append_history(
         {
             "room_id": str(room_id),
             "date": date,
+            "mode": mode,
             "players": [
                 {"user_id": int(p["user_id"]), "username": p.get("username") or ""}
                 for p in players

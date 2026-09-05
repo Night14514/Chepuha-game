@@ -6,13 +6,23 @@ import html
 import logging
 import random
 import sys
+import time
 from typing import Any
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, FSInputFile, Message, ReactionTypeEmoji, TelegramObject
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReactionTypeEmoji,
+    TelegramObject,
+)
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
 import config
@@ -41,12 +51,15 @@ OWNER_COMMANDS = {
     "grand",
     "unadmin",
     "admins",
+    "survey",
+    "call",
 }
 
 ADMIN_COMMANDS = {
     "add",
     "delete",
     "create",
+    "createv2",
     "exc",
     "game",
     "stop",
@@ -72,6 +85,7 @@ HELP_TEXT_ADMIN = HELP_TEXT_USER + """
 /add <user_id> — добавить пользователя
 /delete <username или user_id> — удалить из списка
 /create — создать комнату
+/createV2 — создать комнату версии V2
 /exc <username или user_id> — исключить из комнаты (только лобби)
 /game — начать игру
 /stop — остановить игру или отменить комнату
@@ -85,6 +99,7 @@ HELP_TEXT_OWNER = HELP_TEXT_USER + """
 /list — список авторизованных пользователей
 /rooms — состояние активной комнаты
 /create — создать комнату
+/createV2 — создать комнату версии V2
 /exc <username или user_id> — исключить из комнаты (только лобби)
 /edit — изменить порядок вопросов
 /edit_qu — изменить текст вопросов
@@ -94,7 +109,9 @@ HELP_TEXT_OWNER = HELP_TEXT_USER + """
 /save — сохранить users.txt в GitHub
 /grand <user_id или username> — выдать права админа
 /unadmin <user_id или username> — снять права админа
-/admins — список администраторов"""
+/admins — список администраторов
+/survey — опрос по последней игре
+/call <текст> — сделать объявление всем пользователям"""
 
 RULES_TEXT = """Правила игры «Чепуха»
 
@@ -119,7 +136,14 @@ RULES_TEXT = """Правила игры «Чепуха»
 9. Чем всё закончилось?
 
 Порядок и тексты вопросов может менять создатель до начала партии.
-Минимум игроков для старта: 2."""
+Минимум игроков для старта: 2.
+
+Версия V2:
+В этой версии каждый игрок пишет всю историю сам — от начала и до
+конца, ни с кем не смешивая ответы. В конце готовые истории целиком
+раздаются другим игрокам (никогда не своя собственная). Комната для V2
+создаётся командой /createV2, дальше всё работает так же: /join,
+/game, /finish."""
 
 
 class EditOrder(StatesGroup):
@@ -158,6 +182,19 @@ CHUGUN_PHRASES = [
     "Ну ты и любитель чугуна",
 ]
 _chugun_bag: list[str] = []
+
+NAME_EASTER_EGGS: list[tuple[list[str], str]] = [
+    (["ира", "иришка", "ирина"], "Онет! Госпожа Ши!"),
+    (["эля", "элечка", "эль-примо", "эль примо", "эльпримо"], "Ммм... Элечка ~"),
+    (["света", "светлана", "светочка"], "Светулик:) Любительница чугуна"),
+    (["андрей", "андрюша"], "Андрюшенька... Любитель сухофруктов"),
+    (["азиз", "азизка"], 'Он?! Главный обожатель чугуна и основатель компании "ООО тсосал.com"'),
+    (["тима", "тимур"], "Опять он... Тима... Муж Мартина"),
+    (["мартин"], "Мартииин! Любитель чипсЯков"),
+]
+
+_active_survey: dict[str, Any] | None = None
+survey_lock = asyncio.Lock()
 
 
 def _cmd_name(message: Message) -> str | None:
@@ -214,6 +251,8 @@ def _status_human(room: dict[str, Any]) -> str:
     if status == config.STATUS_LOBBY:
         return "сбор игроков"
     if status == config.STATUS_PLAYING:
+        if room.get("mode", config.MODE_V1) == config.MODE_V2:
+            return "игра идёт, V2"
         n = int(room.get("current_question_index", 0)) + 1
         total = len(room.get("questions") or []) or 9
         return f"игра идёт, вопрос №{n} из {total}"
@@ -279,10 +318,6 @@ def _round_answer_text(val: Any) -> str:
     return str(val)
 
 
-def _has_chugun(text: str) -> bool:
-    return "чугун" in (text or "").lower()
-
-
 def _next_chugun_phrase() -> str:
     global _chugun_bag
     if not _chugun_bag:
@@ -291,9 +326,20 @@ def _next_chugun_phrase() -> str:
     return _chugun_bag.pop()
 
 
-def _ack_for_answer(text: str) -> str:
-    if _has_chugun(text):
+def _check_easter_eggs(text: str) -> str | None:
+    lowered = (text or "").lower()
+    for triggers, reply in NAME_EASTER_EGGS:
+        if any(t in lowered for t in triggers):
+            return reply
+    if "чугун" in lowered:
         return _next_chugun_phrase()
+    return None
+
+
+def _ack_for_answer(text: str) -> str:
+    egg = _check_easter_eggs(text)
+    if egg:
+        return egg
     return "Ответ засчитан, ожидайте ответа других игроков..."
 
 
@@ -337,7 +383,6 @@ def _build_history_text(
         st.format_user_label(int(p["user_id"]), p.get("username"))
         for p in room.get("players", [])
     ]
-    questions = room.get("questions") or st.snapshot_questions()
     chunks = [
         f"Игра #{room['id']}",
         f"Дата: {date}",
@@ -347,9 +392,9 @@ def _build_history_text(
     for i, (player, answers) in enumerate(assignment, start=1):
         reader = st.format_user_label(int(player["user_id"]), player.get("username"))
         chunks.append(f"История {i} (читал: {reader})")
-        for q, ans in zip(questions, answers):
-            chunks.append(q["text"])
-            chunks.append(_pair_text(ans))
+        for row in answers:
+            chunks.append(str(row.get("question") or ""))
+            chunks.append(str(row.get("answer") or ""))
         chunks.append("")
     return "\n".join(chunks).rstrip() + "\n"
 
@@ -359,20 +404,16 @@ def _build_history_raw(
     date: str,
     assignment: list[tuple[dict, list]],
 ) -> dict[str, Any]:
-    players_by_id = {int(p["user_id"]): p for p in room.get("players", [])}
-    questions = room.get("questions") or st.snapshot_questions()
     stories_out = []
     for player, answers in assignment:
         items = []
-        for q, ans in zip(questions, answers):
-            author_id = _pair_uid(ans)
-            author = players_by_id.get(author_id, {})
+        for row in answers:
             items.append(
                 {
-                    "question": q["text"],
-                    "text": _pair_text(ans),
-                    "user_id": author_id,
-                    "username": author.get("username") or "",
+                    "question": str(row.get("question") or ""),
+                    "text": str(row.get("answer") or ""),
+                    "user_id": int(row.get("author_id") or 0),
+                    "username": row.get("author_username") or "",
                 }
             )
         stories_out.append(
@@ -409,8 +450,14 @@ def _history_text_from_raw(raw: dict[str, Any]) -> str:
     return "\n".join(chunks).rstrip() + "\n"
 
 
-def _story_text(answers: list) -> str:
-    return "\n".join(_pair_text(a) for a in answers)
+def _story_plain_text(story: Any) -> str:
+    if isinstance(story, str):
+        return story
+    if isinstance(story, list):
+        if story and isinstance(story[0], dict):
+            return "\n".join(str(row.get("answer") or "") for row in story)
+        return "\n".join(_pair_text(a) for a in story)
+    return str(story)
 
 
 # --- commands ---
@@ -625,6 +672,7 @@ async def cmd_create(message: Message) -> None:
         rooms[room_id] = {
             "id": room_id,
             "status": config.STATUS_LOBBY,
+            "mode": config.MODE_V1,
             "players": [],
             "current_question_index": 0,
             "answers_this_round": {},
@@ -633,6 +681,29 @@ async def cmd_create(message: Message) -> None:
         }
         st.save_rooms(rooms)
     await message.answer(f"Комната успешно создана! Id комнаты: {room_id}")
+
+
+@router.message(Command("createV2", ignore_case=True))
+async def cmd_create_v2(message: Message) -> None:
+    async with room_lock:
+        rooms = st.load_rooms()
+        if st.get_active_room(rooms):
+            await message.answer(
+                "У вас уже есть активная комната. Завершите игру или "
+                "остановите её командой /stop перед созданием новой."
+            )
+            return
+        room_id = _generate_room_id(rooms)
+        rooms[room_id] = {
+            "id": room_id,
+            "status": config.STATUS_LOBBY,
+            "mode": config.MODE_V2,
+            "players": [],
+            "player_progress": {},
+            "questions": [],
+        }
+        st.save_rooms(rooms)
+    await message.answer(f"Комната V2 успешно создана! Id комнаты: {room_id}")
 
 
 @router.message(Command("join"))
@@ -886,10 +957,21 @@ async def cmd_game(message: Message, bot: Bot, state: FSMContext) -> None:
             return
         questions = st.snapshot_questions()
         room["status"] = config.STATUS_PLAYING
-        room["current_question_index"] = 0
-        room["answers_this_round"] = {}
-        room["stories"] = [[] for _ in range(n)]
         room["questions"] = questions
+        mode = room.get("mode", config.MODE_V1)
+        if mode == config.MODE_V2:
+            room["player_progress"] = {
+                str(p["user_id"]): {
+                    "current_index": 0,
+                    "answers": [],
+                    "last_message_id": None,
+                }
+                for p in room["players"]
+            }
+        else:
+            room["current_question_index"] = 0
+            room["answers_this_round"] = {}
+            room["stories"] = [[] for _ in range(n)]
         st.save_rooms(rooms)
         q_text = questions[0]["text"]
         ids = _player_ids(room)
@@ -926,7 +1008,10 @@ async def cmd_result(message: Message) -> None:
         return
     lines = ["Завершённые игры:"]
     for item in items:
-        lines.append(f"{item['room_id']} — {item['date']}")
+        line = f"{item['room_id']} — {item['date']}"
+        if item.get("mode") == config.MODE_V2:
+            line += " (V2)"
+        lines.append(line)
     lines.append("Чтобы получить файл, напишите /get <id>")
     await message.answer("\n".join(lines))
 
@@ -1008,6 +1093,12 @@ async def cmd_finish(message: Message, bot: Bot) -> None:
             finished_ids,
             "Игра завершена! Для просмотра историй напишите /result",
         )
+        if config.OWNER_ID:
+            await _safe_send(
+                bot,
+                config.OWNER_ID,
+                "Хотите узнать, чья история была самой угарной? Запустите опрос командой /survey.",
+            )
 
 
 
@@ -1019,36 +1110,105 @@ async def on_answer(message: Message, bot: Bot, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if not text:
         return
+    ack: str | None = None
+    extra: list[str] = []
+    round_complete = False
+    room_id: str | None = None
+    reveal_room: dict[str, Any] | None = None
     async with room_lock:
         rooms = st.load_rooms()
         room = st.find_player_room(user.id, rooms)
         if not room or room.get("status") != config.STATUS_PLAYING:
             return
         await state.clear()
-        uid_key = str(user.id)
-        already = room.setdefault("answers_this_round", {})
-        if uid_key in already:
-            await message.answer("Вы уже ответили, ожидайте остальных игроков...")
-            return
-        if len(text) > config.MAX_ANSWER_LENGTH:
-            await message.answer(
-                f"Ответ слишком длинный. Сократите до {config.MAX_ANSWER_LENGTH} символов и отправьте заново."
+        if room.get("mode", config.MODE_V1) == config.MODE_V2:
+            extra, reveal_room = _apply_answer_v2(message, rooms, room, user, text)
+        else:
+            ack, round_complete, room_id = await _handle_answer_v1(
+                message, rooms, room, user, text
             )
-            return
-        ack = _ack_for_answer(text)
-        already[uid_key] = {
-            "text": text,
-            "message_id": message.message_id,
-            "round_index": int(room.get("current_question_index", 0)),
-        }
-        st.save_rooms(rooms)
-        n_players = len(room.get("players", []))
-        n_answers = len(already)
-        round_complete = n_answers >= n_players
-        room_id = room["id"]
-    await message.answer(ack)
-    if round_complete:
+    if extra:
+        for part in extra:
+            await message.answer(part)
+    elif ack:
+        await message.answer(ack)
+    if round_complete and room_id:
         await _advance_round(bot, room_id)
+    if reveal_room:
+        await _reveal_current(bot, reveal_room)
+
+
+async def _handle_answer_v1(
+    message: Message,
+    rooms: dict[str, Any],
+    room: dict[str, Any],
+    user: Any,
+    text: str,
+) -> tuple[str | None, bool, str | None]:
+    uid_key = str(user.id)
+    already = room.setdefault("answers_this_round", {})
+    if uid_key in already:
+        await message.answer("Вы уже ответили, ожидайте остальных игроков...")
+        return None, False, None
+    if len(text) > config.MAX_ANSWER_LENGTH:
+        await message.answer(
+            f"Ответ слишком длинный. Сократите до {config.MAX_ANSWER_LENGTH} символов и отправьте заново."
+        )
+        return None, False, None
+    ack = _ack_for_answer(text)
+    already[uid_key] = {
+        "text": text,
+        "message_id": message.message_id,
+        "round_index": int(room.get("current_question_index", 0)),
+    }
+    st.save_rooms(rooms)
+    n_players = len(room.get("players", []))
+    round_complete = len(already) >= n_players
+    return ack, round_complete, str(room["id"])
+
+
+def _apply_answer_v2(
+    message: Message,
+    rooms: dict[str, Any],
+    room: dict[str, Any],
+    user: Any,
+    text: str,
+) -> tuple[list[str], dict[str, Any] | None]:
+    uid_key = str(user.id)
+    questions = room.get("questions") or []
+    progress = room.setdefault("player_progress", {})
+    entry = progress.get(uid_key)
+    if entry is None or int(entry.get("current_index", 0)) >= len(questions):
+        return [], None
+    if len(text) > config.MAX_ANSWER_LENGTH:
+        return [
+            f"Ответ слишком длинный. Сократите до {config.MAX_ANSWER_LENGTH} символов и отправьте заново."
+        ], None
+    egg = _check_easter_eggs(text)
+    entry.setdefault("answers", []).append(text)
+    entry["last_message_id"] = message.message_id
+    entry["current_index"] = int(entry.get("current_index", 0)) + 1
+    idx = int(entry["current_index"])
+    total = len(questions)
+    all_done = bool(progress) and all(
+        int(p.get("current_index", 0)) >= total for p in progress.values()
+    )
+    reveal = None
+    if all_done:
+        _close_room_v2(rooms, room)
+        reveal = room
+    else:
+        st.save_rooms(rooms)
+    msgs: list[str] = []
+    if egg:
+        msgs.append(egg)
+    elif idx < total:
+        msgs.append("Ответ засчитан, ожидайте следующий вопрос...")
+    else:
+        msgs.append("Ваша история готова! Ожидайте остальных игроков...")
+    if idx < total:
+        msgs.append(questions[idx]["text"])
+    return msgs, reveal
 
 
 @router.edited_message(F.text, ~F.text.startswith("/"))
@@ -1064,27 +1224,48 @@ async def on_answer_edited(message: Message) -> None:
         if not room or room.get("status") != config.STATUS_PLAYING:
             return
         uid_key = str(user.id)
-        already = room.setdefault("answers_this_round", {})
-        entry = already.get(uid_key)
-        if not isinstance(entry, dict):
-            return
-        if int(entry.get("message_id") or 0) != message.message_id:
-            return
-        if int(entry.get("round_index") or -1) != int(room.get("current_question_index", 0)):
-            return
-        if len(text) > config.MAX_ANSWER_LENGTH:
-            ack = (
-                f"Отредактированный ответ слишком длинный "
-                f"(максимум {config.MAX_ANSWER_LENGTH} символов), "
-                "сохранён прежний вариант ответа."
-            )
-        else:
-            entry["text"] = text
-            st.save_rooms(rooms)
-            if _has_chugun(text):
-                ack = _next_chugun_phrase()
+        if room.get("mode", config.MODE_V1) == config.MODE_V2:
+            progress = room.get("player_progress") or {}
+            entry = progress.get(uid_key)
+            if not isinstance(entry, dict):
+                return
+            if int(entry.get("last_message_id") or 0) != message.message_id:
+                return
+            ans_idx = int(entry.get("current_index", 0)) - 1
+            answers = entry.get("answers") or []
+            if ans_idx < 0 or ans_idx >= len(answers):
+                return
+            if len(text) > config.MAX_ANSWER_LENGTH:
+                ack = (
+                    f"Отредактированный ответ слишком длинный "
+                    f"(максимум {config.MAX_ANSWER_LENGTH} символов), "
+                    "сохранён прежний вариант ответа."
+                )
             else:
-                ack = "Ответ обновлён, ожидайте ответа других игроков..."
+                answers[ans_idx] = text
+                st.save_rooms(rooms)
+                ack = _check_easter_eggs(text) or "Ответ обновлён."
+            if ack:
+                pass
+        else:
+            already = room.setdefault("answers_this_round", {})
+            entry = already.get(uid_key)
+            if not isinstance(entry, dict):
+                return
+            if int(entry.get("message_id") or 0) != message.message_id:
+                return
+            if int(entry.get("round_index") or -1) != int(room.get("current_question_index", 0)):
+                return
+            if len(text) > config.MAX_ANSWER_LENGTH:
+                ack = (
+                    f"Отредактированный ответ слишком длинный "
+                    f"(максимум {config.MAX_ANSWER_LENGTH} символов), "
+                    "сохранён прежний вариант ответа."
+                )
+            else:
+                entry["text"] = text
+                st.save_rooms(rooms)
+                ack = _check_easter_eggs(text) or "Ответ обновлён, ожидайте ответа других игроков..."
     if ack:
         await message.answer(ack)
 
@@ -1130,6 +1311,67 @@ async def _advance_round(bot: Bot, room_id: str) -> None:
         await _broadcast(bot, ids, next_q)
 
 
+def _pairs_to_story(room: dict[str, Any], pairs: list) -> list[dict[str, Any]]:
+    questions = room.get("questions") or st.snapshot_questions()
+    players_by_id = {int(p["user_id"]): p for p in room.get("players", [])}
+    rows = []
+    for q, pair in zip(questions, pairs):
+        aid = _pair_uid(pair)
+        author = players_by_id.get(aid, {})
+        rows.append(
+            {
+                "question": q["text"],
+                "answer": _pair_text(pair),
+                "author_id": aid,
+                "author_username": author.get("username") or "",
+            }
+        )
+    return rows
+
+
+def _shuffle_readers(assignment: list[tuple[dict, list]]) -> list[tuple[dict, list]]:
+    random.shuffle(assignment)
+    if len(assignment) > 1 and int(assignment[0][0]["user_id"]) == config.OWNER_ID:
+        swap_with = random.randint(1, len(assignment) - 1)
+        assignment[0], assignment[swap_with] = assignment[swap_with], assignment[0]
+    return assignment
+
+
+def _persist_reveal(
+    rooms: dict[str, Any],
+    room: dict[str, Any],
+    assignment: list[tuple[dict, list]],
+) -> None:
+    date = st.today_str()
+    history_text = _build_history_text(room, date, assignment)
+    raw = _build_history_raw(room, date, assignment)
+    mode = room.get("mode", config.MODE_V1)
+    st.append_history(
+        str(room["id"]),
+        date,
+        list(room.get("players", [])),
+        history_text,
+        raw=raw,
+        mode=mode,
+    )
+    room["status"] = config.STATUS_REVEALING
+    room["answers_this_round"] = {}
+    room["reveal_order"] = [int(player["user_id"]) for player, _ in assignment]
+    room["reveal_stories"] = [story for _, story in assignment]
+    room["reveal_index"] = 0
+    st.save_rooms(rooms)
+
+
+def _random_derangement(n: int) -> list[int]:
+    if n < 2:
+        raise ValueError("Derangement requires at least 2 elements")
+    perm = list(range(n))
+    while True:
+        random.shuffle(perm)
+        if all(perm[i] != i for i in range(n)):
+            return perm
+
+
 def _close_room(rooms: dict[str, Any], room: dict[str, Any]) -> dict[str, Any]:
     players = list(room.get("players", []))
     stories = list(room.get("stories", []))
@@ -1137,21 +1379,37 @@ def _close_room(rooms: dict[str, Any], room: dict[str, Any]) -> dict[str, Any]:
     random.shuffle(story_order)
     assignment: list[tuple[dict, list]] = []
     for i, player in enumerate(players):
-        assignment.append((player, stories[story_order[i]]))
-    random.shuffle(assignment)
-    if len(assignment) > 1 and int(assignment[0][0]["user_id"]) == config.OWNER_ID:
-        swap_with = random.randint(1, len(assignment) - 1)
-        assignment[0], assignment[swap_with] = assignment[swap_with], assignment[0]
-    date = st.today_str()
-    history_text = _build_history_text(room, date, assignment)
-    raw = _build_history_raw(room, date, assignment)
-    st.append_history(str(room["id"]), date, players, history_text, raw=raw)
-    room["status"] = config.STATUS_REVEALING
-    room["answers_this_round"] = {}
-    room["reveal_order"] = [int(player["user_id"]) for player, _ in assignment]
-    room["reveal_stories"] = [_story_text(answers) for _, answers in assignment]
-    room["reveal_index"] = 0
-    st.save_rooms(rooms)
+        assignment.append((player, _pairs_to_story(room, stories[story_order[i]])))
+    assignment = _shuffle_readers(assignment)
+    _persist_reveal(rooms, room, assignment)
+    return room
+
+
+def _close_room_v2(rooms: dict[str, Any], room: dict[str, Any]) -> dict[str, Any]:
+    players = list(room.get("players", []))
+    questions = room.get("questions") or st.snapshot_questions()
+    n = len(players)
+    stories_by_author = []
+    progress = room.get("player_progress") or {}
+    for p in players:
+        uid = int(p["user_id"])
+        answers = (progress.get(str(uid)) or {}).get("answers") or []
+        stories_by_author.append(
+            [
+                {
+                    "question": q["text"],
+                    "answer": a,
+                    "author_id": uid,
+                    "author_username": p.get("username") or "",
+                }
+                for q, a in zip(questions, answers)
+            ]
+        )
+    order = _random_derangement(n)
+    assignment = [(players[i], stories_by_author[order[i]]) for i in range(n)]
+    assignment = _shuffle_readers(assignment)
+    room.pop("player_progress", None)
+    _persist_reveal(rooms, room, assignment)
     return room
 
 
@@ -1187,7 +1445,182 @@ async def _reveal_current(bot: Bot, room: dict[str, Any]) -> None:
         reader_id,
         "Тебе выпала честь, прочесть эту легендарную историю! После окончания прочтения нажми на /finish",
     )
-    await _safe_send(bot, reader_id, story)
+    await _safe_send(bot, reader_id, _story_plain_text(story))
+
+
+def _build_survey_keyboard(
+    survey_id: int,
+    candidates: list[dict[str, Any]],
+    voted: set[int],
+) -> InlineKeyboardMarkup:
+    rows = []
+    for c in candidates:
+        mark = "✓ " if int(c["user_id"]) in voted else ""
+        label = f"{mark}{c['label']}"
+        if len(label) > 64:
+            label = label[:64]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"survey:{survey_id}:{int(c['user_id'])}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("survey"))
+async def cmd_survey(message: Message, bot: Bot) -> None:
+    global _active_survey
+    async with survey_lock:
+        if _active_survey is not None:
+            await message.answer("Опрос уже запущен, дождитесь его завершения.")
+            return
+        index = st.load_history_index()
+        if not index:
+            await message.answer("Нет завершённых игр для опроса.")
+            return
+        entry = index[-1]
+        candidates = [
+            {
+                "user_id": int(p["user_id"]),
+                "label": st.format_user_label(int(p["user_id"]), p.get("username")),
+            }
+            for p in entry.get("players", [])
+        ]
+        if len(candidates) < 2:
+            await message.answer("В последней игре недостаточно участников для опроса.")
+            return
+        survey_id = int(time.time() * 1000)
+        _active_survey = {
+            "survey_id": survey_id,
+            "room_id": entry["room_id"],
+            "candidates": candidates,
+            "votes": {},
+            "messages": {},
+        }
+    kb = _build_survey_keyboard(survey_id, candidates, voted=set())
+    for c in candidates:
+        try:
+            sent = await bot.send_message(
+                c["user_id"],
+                "Чья история была самой угарной?",
+                reply_markup=kb,
+            )
+            async with survey_lock:
+                if _active_survey and _active_survey["survey_id"] == survey_id:
+                    _active_survey["messages"][str(c["user_id"])] = {
+                        "chat_id": sent.chat.id,
+                        "message_id": sent.message_id,
+                    }
+        except Exception as e:
+            log.warning("Не удалось отправить опрос игроку %s: %s", c["user_id"], e)
+    await message.answer("Опрос запущен, активен 2 минуты.")
+    asyncio.create_task(_finish_survey_after_delay(bot, survey_id, 120))
+
+
+@router.callback_query(F.data.startswith("survey:"))
+async def on_survey_vote(callback: CallbackQuery) -> None:
+    global _active_survey
+    data = callback.data or ""
+    parts = data.split(":")
+    if len(parts) != 3 or callback.from_user is None:
+        await callback.answer()
+        return
+    try:
+        survey_id = int(parts[1])
+        candidate_id = int(parts[2])
+    except ValueError:
+        await callback.answer()
+        return
+    voter_id = callback.from_user.id
+    kb = None
+    async with survey_lock:
+        if not _active_survey or _active_survey["survey_id"] != survey_id:
+            await callback.answer("Этот опрос уже завершён.")
+            return
+        allowed = {int(c["user_id"]) for c in _active_survey["candidates"]}
+        if voter_id not in allowed:
+            await callback.answer()
+            return
+        voter_key = str(voter_id)
+        chosen = _active_survey["votes"].setdefault(voter_key, set())
+        if candidate_id in chosen:
+            chosen.discard(candidate_id)
+        else:
+            chosen.add(candidate_id)
+        kb = _build_survey_keyboard(
+            survey_id,
+            _active_survey["candidates"],
+            set(chosen),
+        )
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+    await callback.answer("Голос учтён")
+
+
+async def _finish_survey_after_delay(bot: Bot, survey_id: int, delay: int) -> None:
+    await asyncio.sleep(delay)
+    global _active_survey
+    async with survey_lock:
+        if not _active_survey or _active_survey["survey_id"] != survey_id:
+            return
+        survey = _active_survey
+        _active_survey = None
+    tally: dict[int, int] = {int(c["user_id"]): 0 for c in survey["candidates"]}
+    for choices in survey["votes"].values():
+        for cid in choices:
+            tally[int(cid)] = tally.get(int(cid), 0) + 1
+    for msg in survey["messages"].values():
+        try:
+            await bot.delete_message(msg["chat_id"], msg["message_id"])
+        except Exception:
+            pass
+    total_votes = sum(tally.values())
+    if total_votes == 0:
+        result_text = "Опрос завершён. Никто не проголосовал."
+    else:
+        lines = ["Опрос завершён! Результаты:"]
+        for c in survey["candidates"]:
+            lines.append(f"{c['label']}: {tally[int(c['user_id'])]}")
+        top = max(tally.values())
+        winners = [c["label"] for c in survey["candidates"] if tally[int(c["user_id"])] == top]
+        if len(winners) == 1:
+            lines.append(f"Победитель: {winners[0]}")
+        else:
+            lines.append("Ничья между: " + ", ".join(winners))
+        result_text = "\n".join(lines)
+    ids = [int(c["user_id"]) for c in survey["candidates"]]
+    await _broadcast(bot, ids, result_text)
+
+
+@router.message(Command("call"))
+async def cmd_call(message: Message, command: CommandObject, bot: Bot) -> None:
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer(_usage("/call", "<текст объявления>"))
+        return
+    recipients: dict[int, None] = {}
+    for r in st.load_users():
+        recipients[int(r["user_id"])] = None
+    for r in st.load_admins():
+        recipients[int(r["user_id"])] = None
+    recipients.pop(config.OWNER_ID, None)
+    announcement = f"Объявление от создателя:\n\n{text}"
+    sent, failed = 0, 0
+    for uid in recipients:
+        try:
+            await bot.send_message(uid, announcement)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            log.warning("Не удалось отправить объявление %s: %s", uid, e)
+        await asyncio.sleep(0.05)
+    await message.answer(f"Объявление отправлено {sent} пользователям (ошибок: {failed}).")
 
 
 
